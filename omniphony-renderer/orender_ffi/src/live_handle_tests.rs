@@ -403,3 +403,37 @@ fn sessions_can_be_created_and_destroyed_in_turn() {
         assert!(orender_create(ptr::null()).is_null());
     }
 }
+
+/// Object output through the C interface: an object-free stream keeps its
+/// layout and reports no slots; a NULL handle answers 0; the ABI says 13.
+#[test]
+fn moving_objects_through_the_c_interface() {
+    // SAFETY: NULL handles are refused, never dereferenced.
+    unsafe {
+        orender_set_moving_objects(ptr::null_mut(), 4);
+        assert_eq!(orender_moving_objects(ptr::null()), 0);
+        assert_eq!(orender_moving_positions(ptr::null(), ptr::null_mut(), 0), 0);
+    }
+    let s = session();
+    // SAFETY: a live handle from `session`.
+    unsafe { orender_set_moving_objects(s.handle, 20) };
+    let mut out = Vec::new();
+    let mut rendered = 0;
+    for packet in demo().chunks(4096) {
+        let p = process(&s, packet, &mut out, 1 << 16);
+        assert_eq!(p.code, 0);
+        if p.frames == 0 {
+            continue;
+        }
+        rendered += 1;
+        assert_eq!(p.channels, 12, "a stream without objects keeps its layout");
+        // SAFETY: a live handle; NULL `out` asks for the count only.
+        unsafe {
+            assert_eq!(orender_channel_count(s.handle), 12);
+            assert_eq!(orender_moving_objects(s.handle), 0);
+            assert_eq!(orender_moving_positions(s.handle, ptr::null_mut(), 0), 0);
+        }
+    }
+    assert!(rendered > 0);
+    assert_eq!(orender_version_minor(), 13);
+}

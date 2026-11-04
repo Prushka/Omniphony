@@ -222,7 +222,23 @@ pub const ORENDER_ABI_MAJOR: u32 = 0;
 //     the last call returned); orender_process now reads its pts_us argument.
 // 12: added the `heard_us` key of orender_set_option (where the listener is,
 //     relayed to OSC clients as /omniphony/playout/heard).
-pub const ORENDER_ABI_MINOR: u32 = 12;
+// 13: added object output: orender_set_moving_objects, orender_moving_objects,
+//     orender_moving_positions and OrenderMovingSlot (see ABI.md).
+pub const ORENDER_ABI_MINOR: u32 = 13;
+
+/// One slot of object output in the audio a call returned: which object holds
+/// it, and where it was at the audio's first and last frame (ADM cartesian:
+/// right, front, up, each within ±1, ramps applied).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct OrenderMovingSlot {
+    /// 1 while an object holds the slot, 0 for a silent one.
+    pub active: u32,
+    /// The object's PCM channel in the stream; 0xFFFFFFFF for the test object.
+    pub id: u32,
+    pub start: [f32; 3],
+    pub end: [f32; 3],
+}
 
 /// Speaker-position labels written by `orender_channel_layout` and
 /// `orender_bed_layout` (one byte per channel). Mirrors the engine's
@@ -747,6 +763,74 @@ pub unsafe extern "C" fn orender_channel_layout(
     .unwrap_or(0)
 }
 
+/// Object output (ABI minor >= 13): up to 16 of a stream's objects go out
+/// unpanned, each in a channel labelled `Object` after the layout's speakers,
+/// with its position from [`orender_moving_positions`]. 0, the default, pans
+/// every object; above 16 is 16. Set it before the first packet; it is kept
+/// across [`orender_reset`]. Slots are used only for a stream with objects, on
+/// the speaker path and with no output latency; otherwise the layout is as
+/// before. No-op on a NULL handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orender_set_moving_objects(r: *mut OrenderRenderer, slots: u32) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return;
+        }
+        // SAFETY: non-null (checked above) and a live `orender_create` handle.
+        unsafe { &mut *(r as *mut Engine) }.set_moving_slots(slots as usize);
+    }));
+}
+
+/// How many slots of the audio the last call returned hold an object; 0 on a
+/// NULL handle, without object output, or for a stream without objects.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orender_moving_objects(r: *const OrenderRenderer) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return 0;
+        }
+        // SAFETY: non-null (checked above) and a live `orender_create` handle.
+        unsafe { &*(r as *const Engine) }.moving_objects()
+    }))
+    .unwrap_or(0)
+}
+
+/// The slots of the audio the last `orender_process` or `orender_drain` call
+/// returned, in channel order after the speakers.
+///
+/// Returns the slot count `N`. If `out` is non-NULL and `cap >= N`, the first
+/// `N` entries are written; otherwise nothing is: call with `out = NULL` to
+/// size a buffer. 0 on a NULL handle, and when the audio carried no slots.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orender_moving_positions(
+    r: *const OrenderRenderer,
+    out: *mut OrenderMovingSlot,
+    cap: u32,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return 0;
+        }
+        // SAFETY: non-null (checked above) and a live `orender_create` handle.
+        let slots = unsafe { &*(r as *const Engine) }.moving_positions();
+        let n = slots.len() as u32;
+        if !out.is_null() && cap >= n {
+            // SAFETY: non-null, and the caller's buffer holds `cap >= n` entries.
+            let out = unsafe { std::slice::from_raw_parts_mut(out, slots.len()) };
+            for (dst, slot) in out.iter_mut().zip(slots) {
+                *dst = OrenderMovingSlot {
+                    active: slot.active as u32,
+                    id: slot.id,
+                    start: slot.start,
+                    end: slot.end,
+                };
+            }
+        }
+        n
+    }))
+    .unwrap_or(0)
+}
+
 /// Reset after a seek/discontinuity (flushes decoder + renderer state, keeps
 /// live params).
 #[unsafe(no_mangle)]
@@ -926,6 +1010,7 @@ unsafe fn emit_chunks(
     let mut total_frames = 0usize;
     let mut n_channels = engine.channel_count();
     let mut first_sample_pos: Option<u64> = None;
+    let (mut first_moving, mut last_moving) = (None, None);
     for chunk in &chunks {
         // An output-mode switch can land between blocks of one packet; a
         // mixed-layout copy would corrupt the frame geometry. Keep the
@@ -939,6 +1024,12 @@ unsafe fn emit_chunks(
         total_frames += chunk.n_frames;
         n_channels = chunk.n_channels;
         first_sample_pos.get_or_insert(chunk.sample_pos);
+        first_moving.get_or_insert(chunk.moving);
+        last_moving = Some(chunk.moving);
+    }
+    // The call's slots: the first block's starts, the last block's ends.
+    if let (Some(first), Some(last)) = (first_moving, last_moving) {
+        engine.set_returned_moving(&first, &last);
     }
     // Copied out (or deliberately skipped, on a layout change): the sample
     // buffers go back to the engine to be filled again next packet, instead

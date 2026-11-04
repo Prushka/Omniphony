@@ -24,7 +24,7 @@
 // C-ABI minor version: backwards-compatible additions only. Consumers should
 // gate optional features on symbol presence (dlsym), not on this value; it
 // exists for logging and diagnostics.
-#define ORENDER_ABI_MINOR 12
+#define ORENDER_ABI_MINOR 13
 
 // Speaker-position labels written by `orender_channel_layout` and
 // `orender_bed_layout` (one byte per channel). Mirrors the engine's
@@ -134,6 +134,18 @@ typedef struct OrenderConfig {
     const char *osc_host;
 } OrenderConfig;
 
+// One slot of object output in the audio a call returned: which object holds
+// it, and where it was at the audio's first and last frame (ADM cartesian:
+// right, front, up, each within ±1, ramps applied).
+typedef struct OrenderMovingSlot {
+    // 1 while an object holds the slot, 0 for a silent one.
+    uint32_t active;
+    // The object's PCM channel in the stream; 0xFFFFFFFF for the test object.
+    uint32_t id;
+    float start[3];
+    float end[3];
+} OrenderMovingSlot;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -241,6 +253,29 @@ uint32_t orender_channel_count(const struct OrenderRenderer *r);
 // call again. Each byte is an `OrenderChannelLabel` value (255 = Unknown).
 // Returns 0 on error/NULL handle.
 uint32_t orender_channel_layout(const struct OrenderRenderer *r, uint8_t *out_labels, uint32_t cap);
+
+// Object output (ABI minor >= 13): up to 16 of a stream's objects go out
+// unpanned, each in a channel labelled `Object` after the layout's speakers,
+// with its position from [`orender_moving_positions`]. 0, the default, pans
+// every object; above 16 is 16. Set it before the first packet; it is kept
+// across [`orender_reset`]. Slots are used only for a stream with objects, on
+// the speaker path and with no output latency; otherwise the layout is as
+// before. No-op on a NULL handle.
+void orender_set_moving_objects(struct OrenderRenderer *r, uint32_t slots);
+
+// How many slots of the audio the last call returned hold an object; 0 on a
+// NULL handle, without object output, or for a stream without objects.
+uint32_t orender_moving_objects(const struct OrenderRenderer *r);
+
+// The slots of the audio the last `orender_process` or `orender_drain` call
+// returned, in channel order after the speakers.
+//
+// Returns the slot count `N`. If `out` is non-NULL and `cap >= N`, the first
+// `N` entries are written; otherwise nothing is: call with `out = NULL` to
+// size a buffer. 0 on a NULL handle, and when the audio carried no slots.
+uint32_t orender_moving_positions(const struct OrenderRenderer *r,
+                                  struct OrenderMovingSlot *out,
+                                  uint32_t cap);
 
 // Reset after a seek/discontinuity (flushes decoder + renderer state, keeps
 // live params).

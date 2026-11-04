@@ -567,6 +567,7 @@ impl SpatialRenderer {
             // Preallocated so a first block never allocates. Grows only if a
             // stream carries more channels than this.
             channel_states: Vec::with_capacity(64),
+            moving: super::moving::MovingStage::new(),
             reset_requested: std::sync::atomic::AtomicBool::new(false),
             sample_rate,
             distance_model,

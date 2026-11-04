@@ -21,7 +21,7 @@ use anyhow::{Result, anyhow, bail};
 use bridge_api::{RChannelLabel, RDecodedFrame, RInputTransport};
 use renderer::config::{Config, RenderConfig};
 use renderer::metering::AudioMeter;
-use renderer::spatial_renderer::SpatialRenderer;
+use renderer::spatial_renderer::{MovingBlock, MovingSlot, SpatialRenderer};
 use renderer::speaker_layout::SpeakerLayout;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,6 +74,9 @@ pub struct RenderedAudio {
     /// packet went in, so this is how a host that stamps its output with its
     /// input timestamps finds which packet it is looking at.
     pub input_pts_us: Option<i64>,
+    /// The objects this block carries in slots after its speakers, and where
+    /// they were ([`Engine::set_moving_slots`]); none when `width` is 0.
+    pub moving: MovingBlock,
 }
 
 /// Which bounded-buffer call held output is kept for.
@@ -135,6 +138,8 @@ pub struct Engine {
     /// `0` for plain multichannel content. Surfaced over FFI for the host's track
     /// info display. Reset per segment.
     last_object_count: u32,
+    /// The slots of the audio the host was last given ([`Engine::moving_positions`]).
+    returned_moving: MovingBlock,
     /// Channel labels of the bed of the last object-based frame (empty for plain
     /// multichannel / no bed). Surfaced over FFI so the host can show the bed
     /// composition (e.g. "LFE+11 objects"). Reused buffer; reset per segment.
@@ -341,6 +346,7 @@ impl Engine {
             pipeline: FramePipeline::new(coordinate_format),
             decoded_samples: 0,
             last_object_count: 0,
+            returned_moving: MovingBlock::default(),
             last_bed_labels: Vec::new(),
             drc_mode: DrcModeSync::new(),
             log_level,
@@ -844,11 +850,54 @@ impl Engine {
     /// Same source as the standalone renderer's sink labels
     /// ([`SpatialRenderer::output_channel_names`]).
     pub fn channel_layout(&self) -> Vec<RChannelLabel> {
-        self.renderer
+        let mut labels: Vec<RChannelLabel> = self
+            .renderer
             .output_channel_names()
             .iter()
             .map(|name| crate::channel_layout::label_for_speaker_name(name))
-            .collect()
+            .collect();
+        // The objects sent out in slots after the speakers.
+        if self.renderer.output_is_speaker_array() {
+            labels.extend(std::iter::repeat_n(
+                RChannelLabel::Object,
+                self.renderer.moving_width(),
+            ));
+        }
+        labels
+    }
+
+    /// Object output: up to 16 of a stream's objects go out unpanned, in slots
+    /// after the speakers, with their positions ([`Self::moving_positions`]).
+    /// 0, the default, pans every object; kept across [`Self::reset`].
+    pub fn set_moving_slots(&mut self, slots: usize) {
+        self.renderer.set_moving_slots(slots);
+    }
+
+    /// The slots of the audio the host was given last: where each object was
+    /// at its first and last frame.
+    pub fn moving_positions(&self) -> &[MovingSlot] {
+        self.returned_moving.slots()
+    }
+
+    /// How many slots of the audio given last hold an object.
+    pub fn moving_objects(&self) -> u32 {
+        self.returned_moving
+            .slots()
+            .iter()
+            .filter(|s| s.active)
+            .count() as u32
+    }
+
+    /// The slots of the audio a call returns: the first block's starts and the
+    /// last block's ends, kept for [`Self::moving_positions`].
+    pub fn set_returned_moving(&mut self, first: &MovingBlock, last: &MovingBlock) {
+        let mut block = *last;
+        for (slot, before) in block.slots[..block.width].iter_mut().zip(first.slots()) {
+            if before.active && before.id == slot.id {
+                slot.start = before.start;
+            }
+        }
+        self.returned_moving = block;
     }
 
     /// Whether the current presentation carries dynamic objects. A live fact
@@ -1005,6 +1054,8 @@ impl Engine {
         self.discard_in_flight();
         self.input_pts_us = None;
         self.last_output_input_pts = None;
+        // No audio given since: no slots to tell of.
+        self.returned_moving = MovingBlock::default();
         // Nothing is in flight now: a switch the live option asked for while
         // packets were on the thread can land here instead of winding down.
         let want_thread = self.live_decode_thread();
@@ -1644,6 +1695,7 @@ impl Engine {
             sample_rate: self.renderer.sample_rate(),
             sample_pos: sample_pos_at_start,
             input_pts_us: None,
+            moving: self.renderer.moving_block(),
         }))
     }
 
@@ -1664,6 +1716,7 @@ impl Engine {
             sample_rate: self.renderer.sample_rate(),
             sample_pos: self.decoded_samples - sample_count as u64,
             input_pts_us: None,
+            moving: MovingBlock::default(),
         }
     }
 }

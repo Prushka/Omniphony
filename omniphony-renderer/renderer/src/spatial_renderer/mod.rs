@@ -56,7 +56,9 @@ mod cascade;
 mod components;
 mod construction;
 mod layout_follower;
+mod moving;
 pub use construction::RendererSpec;
+pub use moving::{MAX_MOVING_SLOTS, MovingBlock, MovingSlot, TEST_OBJECT_ID};
 mod speaker_stage;
 use components::{ChannelState, evaluation_build_config};
 pub use components::{GAIN_DB_NEG_INF, RenderedFrame, SpatialChannelEvent, gain_db_to_linear};
@@ -178,6 +180,10 @@ pub struct SpatialRenderer {
 
     /// Frame counter for periodic logging
     frame_counter: std::sync::atomic::AtomicU64,
+
+    /// Object output: the objects sent out unpanned, in slots after the
+    /// speakers, and where they are ([`moving`]).
+    moving: moving::MovingStage,
 
     /// Per-channel state (movement detection + gain ramping)
     /// Per-channel state, indexed by channel. A plain `Vec` owned by `&mut
@@ -712,6 +718,7 @@ impl SpatialRenderer {
         {
             self.channel_states.clear();
             self.speaker_stage.drop_gain_carries();
+            self.moving.reset();
         }
 
         // Offline, a BRIR set's loudspeakers replace the layout on the frame
@@ -984,6 +991,8 @@ impl SpatialRenderer {
         // ramp position) and gains, then render to interleaved stereo. Bypasses
         // the entire speaker/VBAP path below.
         if binaural_active {
+            // Headphones get every object rendered: no slots.
+            self.moving.off();
             let (binaural_params, ears, reads_on_sphere) = {
                 let g = self.control.live.read();
                 // Compare against the live source in place: no per-frame clone
@@ -1317,8 +1326,22 @@ impl SpatialRenderer {
             &mut self.last_mix_num_speakers,
             self.speaker_stage.num_speakers,
         );
+        // Object output: the slotted objects are silenced for the mix, which
+        // still advances their ramps, and go out in their slots below.
+        let moving_on = self.moving.on(self.last_output_latency);
+        let mix_pcm: &[f32] = if moving_on {
+            self.moving.assign(
+                &self.channel_states,
+                input_channel_count,
+                live.object_test.is_some(),
+            );
+            self.moving.without_slotted(input_pcm, input_channel_count)
+        } else {
+            self.moving.off();
+            input_pcm
+        };
         let frame = speaker_stage::SpeakerStageFrame {
-            input_pcm,
+            input_pcm: mix_pcm,
             input_channel_count,
             sample_length,
             channel_routing: &channel_routing,
@@ -1384,12 +1407,39 @@ impl SpatialRenderer {
         );
         let object_test_position = block.as_ref().map(|b| b.position);
         let object_test_level = block.as_ref().map(|b| (b.peak_dbfs, b.rms_dbfs));
-        let object_test_active = self.speaker_stage.inject_object_test(
-            live.object_test,
-            block.as_ref(),
-            ramp_context.render_params(),
-            &mut output,
-        );
+        // In a slot, the test object is not panned; isolated, it sounds alone.
+        let test_in_slot = moving_on && self.moving.holds_test_object();
+        let object_test_active = if test_in_slot {
+            block.is_some()
+        } else {
+            self.speaker_stage.inject_object_test(
+                live.object_test,
+                block.as_ref(),
+                ramp_context.render_params(),
+                &mut output,
+            )
+        };
+        let isolated = test_in_slot
+            && live
+                .object_test
+                .is_some_and(|t| t.isolation != crate::live_params::TestIsolation::WithProgramme);
+        if isolated {
+            output.fill(0.0);
+        }
+        if moving_on {
+            let object_params = live.object_params;
+            self.moving.capture(
+                input_pcm,
+                input_channel_count,
+                sample_length,
+                &self.channel_states,
+                |c| object_params.get(c).is_some_and(|o| o.muted),
+                block.as_ref().map(|b| (b.pcm, b.position)),
+                isolated,
+                total_gain,
+                self.sample_rate as f32 * GAIN_SLEW_SECS,
+            );
+        }
 
         let test_active = self.speaker_stage.inject_speaker_test(
             live.speaker_test,
@@ -1449,8 +1499,12 @@ impl SpatialRenderer {
             }
         }
 
-        let speaker_channels = self.num_speakers;
-        self.apply_output_mode_fade(&mut output, speaker_channels);
+        // The slots after the speakers.
+        if moving_on {
+            output = self.moving.widen(output, self.num_speakers, sample_length);
+        }
+        let out_channels = self.num_speakers + if moving_on { self.moving_width() } else { 0 };
+        self.apply_output_mode_fade(&mut output, out_channels);
         // One entry per channel, so the keys are unique and an unstable sort
         // gives the stable order — without the scratch buffer a stable sort
         // allocates past a few dozen entries.
@@ -1459,11 +1513,11 @@ impl SpatialRenderer {
         diag.object_band_sq.sort_unstable_by_key(|(idx, _)| *idx);
         Ok(RenderedFrame {
             samples: output,
-            // Matches the `sample_length * self.num_speakers` resize above.
+            // The speakers, as resized above, and the slots `widen` added.
             // Read from the field, not from output_channel_count(): that one
             // re-reads the live output mode, which the OSC thread may have
             // flipped since this branch was chosen.
-            n_channels: self.num_speakers,
+            n_channels: out_channels,
             object_gains: diag.object_gains,
             object_band_gains: diag.object_band_gains,
             object_band_sq: diag.object_band_sq,
@@ -1615,8 +1669,44 @@ impl SpatialRenderer {
     pub fn output_channel_count(&self) -> usize {
         match self.emitted_output_mode() {
             crate::live_params::OutputMode::Binaural => 2,
-            crate::live_params::OutputMode::SpeakerArray => self.num_speakers,
+            crate::live_params::OutputMode::SpeakerArray => self.num_speakers + self.moving_width(),
         }
+    }
+
+    /// Object output: up to [`MAX_MOVING_SLOTS`] of the stream's objects go
+    /// out unpanned, each in a slot after the speakers, with its position
+    /// ([`Self::moving_positions`]). 0, the default, pans every object. Kept
+    /// across resets. Slots are used only on the speaker path, with no
+    /// output latency, and for a stream whose objects the host names
+    /// ([`Self::set_moving_channels`]).
+    pub fn set_moving_slots(&mut self, slots: usize) {
+        self.moving.set_slots(slots);
+    }
+
+    /// The slots asked for.
+    pub fn moving_slots(&self) -> usize {
+        self.moving.slots()
+    }
+
+    /// Which input channels are the stream's objects, for the next block: the
+    /// host's word, from the channels' labels. Nothing named, no slots.
+    pub fn set_moving_channels(&mut self, objects: impl IntoIterator<Item = bool>) {
+        self.moving.set_objects(objects);
+    }
+
+    /// The last block's slots, as wide as its output's tail.
+    pub fn moving_positions(&self) -> &[MovingSlot] {
+        self.moving.block().slots()
+    }
+
+    /// The last block's slots, by value: hosts keep it with the block's audio.
+    pub fn moving_block(&self) -> MovingBlock {
+        *self.moving.block()
+    }
+
+    /// How many slots the last block carried after its speakers.
+    pub fn moving_width(&self) -> usize {
+        self.moving.block().width
     }
 
     /// The output mode the next rendered frame comes out in.
@@ -1694,6 +1784,9 @@ mod grid_request_tests;
 
 #[cfg(test)]
 mod golden_tests;
+
+#[cfg(test)]
+mod moving_tests;
 
 #[cfg(all(test, feature = "perf-gate"))]
 mod perf_gate;

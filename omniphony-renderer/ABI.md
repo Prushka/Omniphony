@@ -67,6 +67,23 @@ not know that key" — treat it as feature-unavailable, not as an error.
 | `decode_thread` | `on`, `off` (default), `live` (0.11) | 0.10 | Decode on a thread of its own, overlapping the render, so the two share the work across two cores. A packet's audio then comes back from a later `orender_process` call — one packet's per call, about 30 ms of audio behind, or one packet if that is longer; occasionally two while the queue shrinks, so size the buffer for two — or from `orender_drain`, so only a host that takes its timestamps from what the call returns (see [Output timestamps](#output-timestamps)) and drains at end of stream should turn it on. `on`/`off` force it: switch them while nothing is in flight — right after `orender_create`, after `orender_reset`, or once `orender_drain` has returned 0 frames; turning it off with packets still on the thread returns -2. `live` hands the choice to the user's `render.decode_thread` option (config.yaml, Studio, OSC); the engine follows it at packet boundaries, and when it is turned off mid-stream the thread winds down a packet per call before decoding goes back inline. |
 | `heard_us` | a decimal integer | 0.12 | Where the listener is, in the microseconds `*out_pts_us` counts (see [Output timestamps](#output-timestamps)), so from 0 after `orender_reset`. A host that buffers what it is handed plays it later than it is rendered — Kodi banks seconds of it — and only the host knows how much. Reported as the audio plays (a few dozen times a second is plenty), it reaches OSC clients as `/omniphony/playout/heard`, together with `/omniphony/playout/block` markers naming the block each stream message describes, so a client such as Studio can show each block when it is heard. The engine holds nothing back; a host that never sets it changes nothing. |
 
+## Object output
+
+Since 0.13, a host that places objects itself (Windows' spatial sound takes
+them as moving objects) can have up to 16 of a stream's objects leave the
+renderer unpanned: `orender_set_moving_objects(r, slots)` before the first
+packet, kept across `orender_reset`. For a stream with objects, on the speaker
+path and with no output latency, `orender_channel_count` and
+`orender_channel_layout` then add one channel labelled `Object` per slot
+after the layout's speakers. A slot belongs to an object (its PCM channel,
+the `id`) from the first block it is heard in until a reset; an object beyond
+the slots is panned as before, and a slot without an object is silence. A
+slot's channel is the object's PCM times its gain, slewed as the renderer
+slews gains, and the master gain. After each call that returned audio,
+`orender_moving_positions` gives every slot's position (ADM cartesian) at the
+audio's first and last frame, and `orender_moving_objects` how many hold an
+object. The renderer's test object takes a free slot while it is on.
+
 ## Output timestamps
 
 A call's audio can be placed two ways, both right whether `decode_thread` is on

@@ -229,6 +229,18 @@ impl FramePipeline {
         let control = renderer.renderer_control();
 
         let mut stage_counts = StageCounts::default();
+        // Object output takes only the stream's objects, never its fixed
+        // channels, which the renderer sees positioned too.
+        if objects {
+            renderer.set_moving_channels(
+                frame
+                    .channel_labels
+                    .iter()
+                    .map(|label| *label == RChannelLabel::Object),
+            );
+        } else {
+            renderer.set_moving_channels(std::iter::empty());
+        }
         if objects {
             self.stream
                 .publish_object_stream_processing(&control, &frame.channel_labels);
@@ -626,6 +638,64 @@ mod tests {
         };
         let (left, right) = (energy(&samples, channels, 0), energy(&samples, channels, 1));
         assert!(left > 100.0 * right.max(1e-12), "L {left} R {right}");
+    }
+
+    /// Object output: an object frame's objects take the slots after the
+    /// speakers, its fixed channels never (the renderer sees them positioned
+    /// too); plain PCM of the same stream has none.
+    #[test]
+    fn an_object_frames_objects_take_the_slots_and_its_fixed_channels_do_not() {
+        let _overlay = overlay_lock();
+        use RChannelLabel::{L, Object, R};
+        let mut renderer = renderer();
+        renderer.set_moving_slots(2);
+        let mut pipeline = FramePipeline::new(RCoordinateFormat::Cartesian);
+        let mut object_frame = frame(&[L, R, Object], &[1 << 22, 1 << 22, 1 << 22]);
+        object_frame.metadata = RVec::from(vec![RMetadataFrame {
+            events: RVec::from(vec![REvent {
+                id: 0,
+                sample_pos: 0,
+                has_pos: true,
+                pos: [1.0, 1.0, 0.0],
+                gain_db: 0,
+                size: [0.0; 3],
+                ramp_duration: 0,
+            }]),
+            object_channels: RVec::from(vec![RObjectChannel { id: 0, channel: 2 }]),
+            channel_gains: RVec::new(),
+            name_updates: RVec::new(),
+            sample_pos: 0,
+            ramp_duration: 0,
+        }]);
+        for _ in 0..8 {
+            pipeline
+                .prepare(&object_frame, 0, Some(&mut renderer), None)
+                .expect("prepare");
+            render(&mut pipeline, &mut renderer, &object_frame, true);
+        }
+        let out = render(&mut pipeline, &mut renderer, &object_frame, true);
+        let FrameOutput::Rendered { samples, channels } = out.output else {
+            panic!("an object frame renders");
+        };
+        assert_eq!(channels, 14, "7.1.4 and two slots");
+        let slots = renderer.moving_positions();
+        assert!(
+            slots[0].active && slots[0].id == 2,
+            "the object holds slot 0: {slots:?}"
+        );
+        assert!(!slots[1].active, "no fixed channel takes a slot");
+        assert!(energy(&samples, 14, 12) > 0.0);
+        assert!(energy(&samples, 14, 0) > 0.0, "L is in the speakers");
+
+        let pcm = frame(&[L, R], &[1 << 22, 0]);
+        pipeline
+            .prepare(&pcm, SAMPLES as u64, Some(&mut renderer), None)
+            .expect("prepare");
+        let out = render(&mut pipeline, &mut renderer, &pcm, false);
+        let FrameOutput::Rendered { channels, .. } = out.output else {
+            panic!("channel content renders");
+        };
+        assert_eq!(channels, 12, "plain PCM has no slots");
     }
 
     /// The `host` channel render mode renders nothing: the decoded channels

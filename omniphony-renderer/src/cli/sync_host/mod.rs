@@ -2289,6 +2289,7 @@ fn push_fill(engine: &mut Engine, ep: &mut Epoch, ctx: &PlayCtx<'_>, frames: usi
             sample_rate: format.rate,
             sample_pos: FILL_POS,
             input_pts_us: None,
+            moving: Default::default(),
         }],
     );
 }
@@ -2589,6 +2590,7 @@ mod tests {
             sample_rate: 48_000,
             sample_pos: 0,
             input_pts_us: None,
+            moving: Default::default(),
         }
     }
 

@@ -211,6 +211,41 @@ const REALTIME_MODELS: &[(&str, f32)] = &[
 /// wrapped around each. All are sized for the layout when the stage's bands
 /// are built and handed back on every call, so the render thread allocates
 /// nothing for them.
+/// Object output: the slots, their samples and positions, and the widened
+/// output, all reuse what the first blocks allocated.
+#[test]
+fn a_warmed_up_render_with_moving_objects_does_not_allocate() {
+    for ramp_mode in [RampMode::Frame, RampMode::Sample, RampMode::Interp] {
+        let mut r = renderer();
+        {
+            let control = r.renderer_control();
+            let mut live = control.live.write();
+            // The FIR bank's latency turns object output off: Lr4 has none.
+            live.options.crossover_type = CrossoverType::Lr4;
+            live.options.ramp_mode = ramp_mode;
+        }
+        r.set_moving_slots(4);
+        r.set_moving_channels((0..CHANNELS).map(|c| c >= BEDS.len()));
+        // The slots are on: the output carries them after the speakers.
+        let mut evs = Vec::new();
+        events(0, &mut evs);
+        let pcm = vec![0.1f32; BLOCK * CHANNELS];
+        let frame = r
+            .render_frame(&pcm, CHANNELS, &evs, Vec::new(), false)
+            .unwrap();
+        assert_eq!(
+            frame.n_channels,
+            12 + 4,
+            "{ramp_mode:?}: slots after the speakers"
+        );
+        let allocations = count_steady_state_of(r, false, 400, 200);
+        assert_eq!(
+            allocations, 0,
+            "{ramp_mode:?}: {allocations} allocation(s) in 200 warmed-up blocks with slots"
+        );
+    }
+}
+
 #[test]
 fn a_warmed_up_realtime_render_does_not_allocate() {
     for &(backend, spread) in REALTIME_MODELS {

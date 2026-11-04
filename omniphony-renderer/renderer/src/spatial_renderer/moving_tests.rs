@@ -294,3 +294,32 @@ fn reset_keeps_the_slot_count() {
 }
 
 const GAIN_DB_NEG_INF_FOR_TESTS: f32 = components::GAIN_DB_NEG_INF;
+
+/// After a seek the host's first frames can come before the stream's objects
+/// (the channel path): an object stream keeps its slots, silent, so that its
+/// layout does not change under the player.
+#[test]
+fn an_object_stream_keeps_its_slots_through_a_reset() {
+    let mut r = renderer();
+    object_stream(&mut r, 1);
+    r.set_moving_slots(2);
+    r.set_moving_channels([false, true]);
+    let pcm = constant_block(&[0.0, 0.1]);
+    settled(
+        &mut r,
+        &pcm,
+        2,
+        &[lfe(), object_at(1, [-1.0, 1.0, 0.0], 0.0, 0)],
+    );
+    r.reset_runtime_state();
+    // The first frame after the reset: no objects named yet.
+    r.set_moving_channels(std::iter::empty());
+    let out = r.render_frame(&pcm, 2, &[], Vec::new(), false).unwrap();
+    assert_eq!(out.n_channels, SPEAKERS + 2, "the layout keeps its slots");
+    assert!(r.moving_positions().iter().all(|s| !s.active));
+    // A new slot count is a new stream: it starts without them.
+    r.set_moving_slots(2);
+    r.set_moving_channels(std::iter::empty());
+    let out = r.render_frame(&pcm, 2, &[], Vec::new(), false).unwrap();
+    assert_eq!(out.n_channels, SPEAKERS);
+}

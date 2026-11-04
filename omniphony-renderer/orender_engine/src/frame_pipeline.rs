@@ -692,10 +692,18 @@ mod tests {
             .prepare(&pcm, SAMPLES as u64, Some(&mut renderer), None)
             .expect("prepare");
         let out = render(&mut pipeline, &mut renderer, &pcm, false);
-        let FrameOutput::Rendered { channels, .. } = out.output else {
+        let FrameOutput::Rendered { samples, channels } = out.output else {
             panic!("channel content renders");
         };
-        assert_eq!(channels, 12, "plain PCM has no slots");
+        // The stream keeps its layout; its object is not in this block, so its
+        // slot is silent and holds no object.
+        assert_eq!(channels, 14, "the layout keeps its slots");
+        assert!(renderer.moving_positions().iter().all(|s| !s.active));
+        assert_eq!(
+            energy(&samples, 14, 12),
+            0.0,
+            "nothing read past the block's channels"
+        );
     }
 
     /// The `host` channel render mode renders nothing: the decoded channels

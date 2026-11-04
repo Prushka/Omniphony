@@ -47,6 +47,10 @@ pub(super) struct MovingStage {
     asked: usize,
     /// Which input channels are the stream's objects, as the host said for this block.
     object: [bool; MAX_INPUT_CHANNELS],
+    /// The stream has had objects since the slots were set: it keeps them in
+    /// its layout through a reset, whose first blocks can come before its
+    /// objects do, so that the layout does not change under the host.
+    seen_objects: bool,
     /// The object (PCM channel, or the test object) each slot belongs to.
     owner: [Option<u32>; MAX_MOVING_SLOTS],
     /// Each slot's gain as it slews towards its object's.
@@ -66,6 +70,7 @@ impl MovingStage {
         Self {
             asked: 0,
             object: [false; MAX_INPUT_CHANNELS],
+            seen_objects: false,
             owner: [None; MAX_MOVING_SLOTS],
             gain: [0.0; MAX_MOVING_SLOTS],
             block: MovingBlock::default(),
@@ -77,6 +82,7 @@ impl MovingStage {
 
     pub(super) fn set_slots(&mut self, slots: usize) {
         self.asked = slots.min(MAX_MOVING_SLOTS);
+        self.seen_objects = false;
         self.reset();
     }
 
@@ -89,6 +95,7 @@ impl MovingStage {
         for (slot, is_object) in self.object.iter_mut().zip(objects) {
             *slot = is_object;
         }
+        self.seen_objects |= self.object.iter().any(|&o| o);
     }
 
     pub(super) fn reset(&mut self) {
@@ -97,10 +104,10 @@ impl MovingStage {
         self.block = MovingBlock::default();
     }
 
-    /// Whether this block goes out with slots: some asked, a stream of
-    /// objects, and a path whose speakers come out as soon as the slots do.
+    /// Whether this block goes out with slots: some asked, a stream that has
+    /// had objects, and a path whose speakers come out as soon as the slots do.
     pub(super) fn on(&self, latency_samples: usize) -> bool {
-        self.asked > 0 && latency_samples == 0 && self.object.iter().any(|&o| o)
+        self.asked > 0 && latency_samples == 0 && self.seen_objects
     }
 
     pub(super) fn block(&self) -> &MovingBlock {
@@ -184,7 +191,11 @@ impl MovingStage {
         };
         let previous = self.block;
         for slot in 0..width {
-            let Some(id) = self.owner[slot] else {
+            // No object, or one not in this block (plain PCM of the same
+            // stream): the slot is silent and holds nothing.
+            let Some(id) =
+                self.owner[slot].filter(|&id| id == TEST_OBJECT_ID || (id as usize) < channels)
+            else {
                 self.block.slots[slot] = MovingSlot::default();
                 self.gain[slot] = 0.0;
                 continue;

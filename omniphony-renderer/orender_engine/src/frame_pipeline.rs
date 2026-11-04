@@ -687,23 +687,32 @@ mod tests {
         assert!(energy(&samples, 14, 12) > 0.0);
         assert!(energy(&samples, 14, 0) > 0.0, "L is in the speakers");
 
-        let pcm = frame(&[L, R], &[1 << 22, 0]);
-        pipeline
-            .prepare(&pcm, SAMPLES as u64, Some(&mut renderer), None)
-            .expect("prepare");
-        let out = render(&mut pipeline, &mut renderer, &pcm, false);
-        let FrameOutput::Rendered { samples, channels } = out.output else {
-            panic!("channel content renders");
-        };
-        // The stream keeps its layout; its object is not in this block, so its
-        // slot is silent and holds no object.
-        assert_eq!(channels, 14, "the layout keeps its slots");
-        assert!(renderer.moving_positions().iter().all(|s| !s.active));
-        assert_eq!(
-            energy(&samples, 14, 12),
-            0.0,
-            "nothing read past the block's channels"
-        );
+        // Plain PCM of the same stream: the layout keeps its slots, silent and
+        // holding nothing, whether the block is narrower than the object's
+        // channel or has a fixed channel there (C at 2), which stays in the
+        // speakers.
+        for (labels, levels, centre) in [
+            (&[L, R][..], &[1 << 22, 0][..], false),
+            (&[L, R, RChannelLabel::C][..], &[0, 0, 1 << 22][..], true),
+        ] {
+            let pcm = frame(labels, levels);
+            pipeline
+                .prepare(&pcm, SAMPLES as u64, Some(&mut renderer), None)
+                .expect("prepare");
+            let out = render(&mut pipeline, &mut renderer, &pcm, false);
+            let FrameOutput::Rendered { samples, channels } = out.output else {
+                panic!("channel content renders");
+            };
+            assert_eq!(channels, 14, "the layout keeps its slots");
+            assert!(renderer.moving_positions().iter().all(|s| !s.active));
+            assert_eq!(energy(&samples, 14, 12), 0.0, "no fixed channel in a slot");
+            if centre {
+                assert!(
+                    energy(&samples, 14, 2) > 0.0,
+                    "the centre is in the speakers"
+                );
+            }
+        }
     }
 
     /// The `host` channel render mode renders nothing: the decoded channels

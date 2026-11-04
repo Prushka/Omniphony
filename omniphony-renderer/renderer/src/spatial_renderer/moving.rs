@@ -144,6 +144,12 @@ impl MovingStage {
         }
     }
 
+    /// A slot's object channel is in this block, and an object in it: a block
+    /// of the same stream's plain PCM has no object there, whatever its width.
+    fn holds(&self, channel: usize, channels: usize) -> bool {
+        channel < channels && self.object.get(channel).copied().unwrap_or(false)
+    }
+
     /// The input for the speaker mix: the slotted channels silenced, so that
     /// their ramps still advance there and nothing of them is panned.
     pub(super) fn without_slotted<'a>(&'a mut self, input: &[f32], channels: usize) -> &'a [f32] {
@@ -154,7 +160,7 @@ impl MovingStage {
         }
         for owner in self.owner[..self.asked].iter().flatten() {
             let c = *owner as usize;
-            if c >= channels {
+            if !self.holds(c, channels) {
                 continue;
             }
             for frame in self.scratch.chunks_exact_mut(channels) {
@@ -193,8 +199,8 @@ impl MovingStage {
         for slot in 0..width {
             // No object, or one not in this block (plain PCM of the same
             // stream): the slot is silent and holds nothing.
-            let Some(id) =
-                self.owner[slot].filter(|&id| id == TEST_OBJECT_ID || (id as usize) < channels)
+            let Some(id) = self.owner[slot]
+                .filter(|&id| id == TEST_OBJECT_ID || self.holds(id as usize, channels))
             else {
                 self.block.slots[slot] = MovingSlot::default();
                 self.gain[slot] = 0.0;
